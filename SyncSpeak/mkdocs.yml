@@ -1,0 +1,82 @@
+site_name: Syncspeak Documentation
+site_url: https://kiminus.github.io/SyncSpeak-Public/
+repo_url: https://github.com/kiminus/SyncSpeak-Public
+
+theme:
+  name: material
+  custom_dir: overrides
+  palette:
+    primary: indigo
+    accent: indigo
+  features:
+    - content.code.copy
+    - content.code.select
+    - content.code.annotate
+    - content.footnote.tooltips
+    - navigation.footer
+    - navigation.top
+    - toc.integrate
+
+# Extensions add helpful features like code highlighting
+markdown_extensions:
+  - attr_list
+  - pymdownx.emoji:
+        emoji_index: !!python/name:material.extensions.emoji.twemoji
+        emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+        anchor_linenums: true
+        line_spans: __span
+        pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+        custom_fences:
+            - name: mermaid
+              class: mermaid
+              format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+        alternate_style: true
+  - admonition
+  - pymdownx.details
+  - footnotes
+  - def_list
+  - pymdownx.tasklist:
+        custom_checkbox: true
+  - md_in_html
+  - pymdownx.arithmatex:
+        generic: true
+  - tables
+  - pymdownx.blocks.caption
+
+extra:
+  social:
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/in/zilin-l-17b71022b/
+    - icon: fontawesome/brands/github
+      link: https://github.com/kiminus
+    - icon: fontawesome/solid/code
+      link: https://github.com/kiminus/SyncSpeak-Public
+    - icon: fontawesome/solid/globe
+      link: https://kiminus.github.io/Kiminus
+  meta:
+    - name: robots
+      content: "noindex, nofollow"
+  generator: false
+
+plugins:
+  - search: {}
+
+extra_javascript:
+  - js/katex.js
+  - https://code.jquery.com/jquery-3.7.1.min.js
+  - https://unpkg.com/katex@0/dist/katex.min.js
+  - https://unpkg.com/katex@0/dist/contrib/auto-render.min.js
+  - https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js
+  - js/init-datatables.js
+
+extra_css:
+  - https://unpkg.com/katex@0/dist/katex.min.css
+  - https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css
+
+copyright: "© 2024 Zilin Liu"
+
