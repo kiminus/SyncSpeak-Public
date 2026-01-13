@@ -1,3 +1,1 @@
-# Custom RISC Architecture Documentation
-
-
+# SyncSpeak Documentation

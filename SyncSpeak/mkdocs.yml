@@ -55,7 +55,7 @@ extra:
     - icon: fontawesome/brands/github
       link: https://github.com/kiminus
     - icon: fontawesome/solid/code
-      link: https://github.com/kiminus/SyncSpeak-Public
+      link: https://kiminus.github.io/SyncSpeak-Public/
     - icon: fontawesome/solid/globe
       link: https://kiminus.github.io/Kiminus
   meta:
