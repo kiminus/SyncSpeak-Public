@@ -1,7 +1,7 @@
 /**
  * INMP441 I2S Microphone → WiFi HTTP POST Audio Stream
  * Board: NodeMCU ESP-32S
- * Framework: ESP-IDF (PlatformIO)
+ * Framework: Arduino (PlatformIO)
  *
  * POSTs chunked raw 16-bit signed PCM to SERVER_HOST:SERVER_PORT/audio.
  * Flushes when the audio buffer is full OR every SEND_INTERVAL_MS.
@@ -12,19 +12,9 @@
  *   INMP441 WS   → GPIO15  INMP441 L/R  → GND
  */
 
-#include <stdio.h>
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "driver/i2s.h"
-#include "esp_log.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
+#include <Arduino.h>
+#include <WiFi.h>
+#include <driver/i2s.h>
 
 /* ═══════════════════════════════════════════════════════════════════
  *  CONFIGURATION — EDIT THESE
@@ -32,7 +22,7 @@
 #define WIFI_SSID          "UCScamDeigo"
 #define WIFI_PASS          "mainwater348"
 
-#define SERVER_HOST        "192.168.0.125"
+#define SERVER_HOST        "192.168.0.210"
 #define SERVER_PORT        8000
 #define SERVER_PATH        "/audio"
 
@@ -51,59 +41,10 @@
 #define DMA_BUF_LEN        1024
 #define READ_BUF_SAMPLES   512
 
-static const char *TAG = "MIC_STREAM";
-
-static EventGroupHandle_t s_wifi_event_group;
-#define WIFI_CONNECTED_BIT  BIT0
-
-/* ═══════════════════════════════════════════════════════════════════
- *  WiFi
- * ═══════════════════════════════════════════════════════════════════ */
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi disconnected — reconnecting...");
-        esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&e->ip_info.ip));
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-static void wifi_init(void)
-{
-    s_wifi_event_group = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
-
-    wifi_config_t wifi_config = {};
-    strncpy((char *)wifi_config.sta.ssid,     WIFI_SSID, sizeof(wifi_config.sta.ssid));
-    strncpy((char *)wifi_config.sta.password,  WIFI_PASS, sizeof(wifi_config.sta.password));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Connecting to WiFi '%s'...", WIFI_SSID);
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
-                        pdFALSE, pdTRUE, portMAX_DELAY);
-}
-
 /* ═══════════════════════════════════════════════════════════════════
  *  I2S Microphone
  * ═══════════════════════════════════════════════════════════════════ */
-static void i2s_init(void)
+static void i2s_init()
 {
     i2s_config_t cfg = {};
     cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
@@ -124,38 +65,15 @@ static void i2s_init(void)
     pins.data_out_num = I2S_PIN_NO_CHANGE;
     pins.data_in_num  = I2S_SD_PIN;
 
-    ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &cfg, 0, NULL));
-    ESP_ERROR_CHECK(i2s_set_pin(I2S_PORT, &pins));
-    ESP_ERROR_CHECK(i2s_start(I2S_PORT));
-    ESP_LOGI(TAG, "I2S mic initialized (SR=%d Hz)", SAMPLE_RATE);
-}
-
-/* ── helpers ───────────────────────────────────────────────────── */
-static bool sock_send_all(int sock, const void *data, int len)
-{
-    const char *p = (const char *)data;
-    while (len > 0) {
-        int n = send(sock, p, len, 0);
-        if (n <= 0) return false;
-        p += n;
-        len -= n;
-    }
-    return true;
-}
-
-/* Send one HTTP chunked-encoding chunk */
-static bool send_chunk(int sock, const void *data, int byte_len)
-{
-    char hdr[16];
-    int hdr_len = snprintf(hdr, sizeof(hdr), "%x\r\n", byte_len);
-    return sock_send_all(sock, hdr, hdr_len) &&
-           sock_send_all(sock, data, byte_len) &&
-           sock_send_all(sock, "\r\n", 2);
+    i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
+    i2s_set_pin(I2S_PORT, &pins);
+    i2s_start(I2S_PORT);
+    Serial.printf("I2S mic initialized (SR=%d Hz)\n", SAMPLE_RATE);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Audio push task
- *  - opens ONE TCP connection
+ *  - opens ONE TCP connection via WiFiClient
  *  - sends HTTP POST headers with Transfer-Encoding: chunked
  *  - accumulates PCM samples, flushes when buffer full OR timer fires
  *  - reconnects automatically on error
@@ -167,38 +85,24 @@ static void audio_push_task(void *arg)
     int buf_count = 0;
 
     while (1) {
-        /* ── Connect ───────────────────────────────────────── */
-        struct sockaddr_in addr = {};
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons(SERVER_PORT);
-        inet_pton(AF_INET, SERVER_HOST, &addr.sin_addr);
-
-        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "socket() failed");
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            continue;
+        /* ── Wait for WiFi ─────────────────────────────────── */
+        while (WiFi.status() != WL_CONNECTED) {
+            Serial.println("Waiting for WiFi...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
 
-        /* 10-second send/recv timeouts */
-        struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        /* ── Connect ───────────────────────────────────────── */
+        WiFiClient client;
+        client.setNoDelay(true);
 
-        /* Disable Nagle — we control chunking ourselves */
-        int nodelay = 1;
-        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            ESP_LOGE(TAG, "connect() to %s:%d failed", SERVER_HOST, SERVER_PORT);
-            close(sock);
+        if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+            Serial.printf("connect() to %s:%d failed\n", SERVER_HOST, SERVER_PORT);
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
 
         /* ── Send HTTP headers ─────────────────────────────── */
-        char headers[512];
-        int hlen = snprintf(headers, sizeof(headers),
+        client.printf(
             "POST %s HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
             "Content-Type: application/octet-stream\r\n"
@@ -210,22 +114,18 @@ static void audio_push_task(void *arg)
             "\r\n",
             SERVER_PATH, SERVER_HOST, SERVER_PORT, SAMPLE_RATE);
 
-        if (!sock_send_all(sock, headers, hlen)) {
-            ESP_LOGE(TAG, "Failed to send headers");
-            close(sock);
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            continue;
-        }
-
-        ESP_LOGI(TAG, "Connected — streaming to http://%s:%d%s",
-                 SERVER_HOST, SERVER_PORT, SERVER_PATH);
+        Serial.printf("Connected — streaming to http://%s:%d%s\n",
+                      SERVER_HOST, SERVER_PORT, SERVER_PATH);
 
         buf_count = 0;
         TickType_t last_flush = xTaskGetTickCount();
         bool error = false;
 
         /* ── Streaming loop ────────────────────────────────── */
-        while (!error) {
+        static int debug_tick = 0;
+        static int dropout_count = 0;
+
+        while (!error && client.connected()) {
             size_t bytes_read = 0;
             esp_err_t err = i2s_read(I2S_PORT, raw, sizeof(raw),
                                      &bytes_read, pdMS_TO_TICKS(50));
@@ -234,8 +134,6 @@ static void audio_push_task(void *arg)
             int count = (int)(bytes_read / sizeof(int32_t));
 
             /* DEBUG: log stats every ~1 second to monitor mic health */
-            static int debug_tick = 0;
-            static int dropout_count = 0;
             if (++debug_tick >= (SAMPLE_RATE / READ_BUF_SAMPLES)) {
                 int32_t mn = raw[0], mx = raw[0];
                 int zeros = 0;
@@ -246,33 +144,36 @@ static void audio_push_task(void *arg)
                 }
                 if (mn == 0 && mx == 0) {
                     dropout_count++;
-                    ESP_LOGW(TAG, "ALL ZEROS — mic dropout #%d (check wiring!)", dropout_count);
-                } else {
-                    ESP_LOGI(TAG, "raw range: [%ld .. %ld]  zeros=%d/%d  dropouts=%d",
-                             (long)mn, (long)mx, zeros, count, dropout_count);
+                    Serial.printf("ALL ZEROS — mic dropout #%d (check wiring!)\n", dropout_count);
                 }
+                Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
                 debug_tick = 0;
             }
 
             for (int i = 0; i < count && buf_count < SEND_BUF_SAMPLES; i++) {
                 /* INMP441: 24-bit audio left-justified in 32-bit frame.
-                 * Bits 31..8 contain audio. >> 16 takes the top 16 bits cleanly.
-                 * (>> 8 was WRONG — crammed 24 bits into int16 → overflow/zeros) */
+                 * >> 16 takes the top 16 bits cleanly. */
                 send_buf[buf_count++] = (int16_t)(raw[i] >> 16);
             }
 
-            TickType_t now      = xTaskGetTickCount();
-            bool buf_full       = buf_count >= SEND_BUF_SAMPLES;
-            bool interval_hit   = (now - last_flush) >= pdMS_TO_TICKS(SEND_INTERVAL_MS);
+            TickType_t now    = xTaskGetTickCount();
+            bool buf_full     = buf_count >= SEND_BUF_SAMPLES;
+            bool interval_hit = (now - last_flush) >= pdMS_TO_TICKS(SEND_INTERVAL_MS);
 
             if ((buf_full || interval_hit) && buf_count > 0) {
                 int byte_len = buf_count * (int)sizeof(int16_t);
-                if (!send_chunk(sock, send_buf, byte_len)) {
-                    ESP_LOGW(TAG, "Server disconnected — reconnecting...");
+
+                /* Send one HTTP chunked-encoding chunk */
+                char hdr[16];
+                snprintf(hdr, sizeof(hdr), "%x\r\n", byte_len);
+                bool ok = client.print(hdr) &&
+                          client.write((const uint8_t *)send_buf, byte_len) == (size_t)byte_len &&
+                          client.print("\r\n");
+
+                if (!ok) {
+                    Serial.println("Server disconnected — reconnecting...");
                     error = true;
                 } else {
-                    ESP_LOGD(TAG, "Flushed %d samples (%s)",
-                             buf_count, buf_full ? "buf full" : "interval");
                     buf_count  = 0;
                     last_flush = xTaskGetTickCount();
                 }
@@ -280,28 +181,36 @@ static void audio_push_task(void *arg)
         }
 
         /* Terminate chunked stream cleanly */
-        sock_send_all(sock, "0\r\n\r\n", 5);
-        close(sock);
+        client.print("0\r\n\r\n");
+        client.stop();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Main
+ *  Arduino entry points
  * ═══════════════════════════════════════════════════════════════════ */
-extern "C" void app_main(void)
+void setup()
 {
-    ESP_LOGI(TAG, "=== INMP441 WiFi Audio Pusher ===");
+    Serial.begin(115200);
+    Serial.println("=== INMP441 WiFi Audio Pusher ===");
+    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
 
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("Connecting to WiFi '%s'...", WIFI_SSID);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
     }
-    ESP_ERROR_CHECK(ret);
+    Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
 
-    wifi_init();
     i2s_init();
 
     xTaskCreatePinnedToCore(audio_push_task, "audio_push", 8192, NULL, 5, NULL, 1);
+}
+
+void loop()
+{
+    /* Everything runs in audio_push_task */
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
