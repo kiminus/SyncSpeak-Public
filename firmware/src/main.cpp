@@ -3,8 +3,14 @@
  * Board: NodeMCU ESP-32S
  * Framework: Arduino (PlatformIO)
  *
- * POSTs chunked raw 16-bit signed PCM to SERVER_HOST:SERVER_PORT/audio.
- * Flushes when the audio buffer is full OR every SEND_INTERVAL_MS.
+ * Architecture: Producer / Consumer via FreeRTOS queues
+ *   mic_capture_task  (Core 1, pri 5) — reads I2S, filters, enqueues chunks
+ *   net_send_task     (Core 0, pri 4) — dequeues chunks, POSTs over HTTP
+ *
+ * A fixed pool of QUEUE_DEPTH static buffers is shared between the two tasks.
+ * The producer rotates through them with a simple index; no free-list needed.
+ * Recording never stalls: if the net falls behind, the oldest queued chunk
+ * is evicted (it points to the same slot write_idx is about to reuse anyway).
  *
  * Wiring:
  *   INMP441 VDD  → 3.3V   INMP441 GND  → GND
@@ -17,20 +23,21 @@
 #include <driver/i2s.h>
 
 /* ═══════════════════════════════════════════════════════════════════
- *  CONFIGURATION — EDIT THESE
+ *  CONFIGURATION
  * ═══════════════════════════════════════════════════════════════════ */
-#define WIFI_SSID          "UCScamDeigo"
-#define WIFI_PASS          "mainwater348"
+#include "constants.h"   /* extern declarations for secrets (defined in secrets.cpp) */
 
-#define SERVER_HOST        "192.168.0.210"
-#define SERVER_PORT        8000
 #define SERVER_PATH        "/audio"
 
-/* Flush audio when buffer reaches this many samples OR after this many ms */
 #define SEND_INTERVAL_MS   200
-/* Buffer holds 2× the interval worth of samples so we never drop */
 #define SAMPLE_RATE        16000
-#define SEND_BUF_SAMPLES   (SAMPLE_RATE * SEND_INTERVAL_MS / 1000 * 2)  /* 6400 */
+/* Samples per chunk: 200ms worth */
+#define CHUNK_SAMPLES      (SAMPLE_RATE * SEND_INTERVAL_MS / 1000)   /* 3200 */
+
+/* ── Queue / buffer pool ─────────────────────────────────────────── */
+/* Number of audio buffers in the shared pool.
+ * Each is CHUNK_SAMPLES * 2 bytes = 6400 bytes → pool = 25600 bytes total. */
+#define QUEUE_DEPTH        4
 
 /* ── I2S / Mic Pins ─────────────────────────────────────────────── */
 #define I2S_SD_PIN         32
@@ -41,8 +48,50 @@
 #define DMA_BUF_LEN        1024
 #define READ_BUF_SAMPLES   512
 
+/* ── Filter Settings ────────────────────────────────────────────── */
+/* Single-pole IIR high-pass filter.
+ *   HP_ALPHA = fc / (fc + fs)   →   0.01 ≈ 160 Hz cutoff @ 16 kHz
+ *   0.005 = ~80 Hz  |  0.01 = ~160 Hz  |  0.02 = ~320 Hz          */
+#define HP_ALPHA           0.01f
+
+/* Noise gate: zero out samples below this amplitude. 0 = disabled. */
+#define NOISE_GATE_THRESH  100
+
 /* ═══════════════════════════════════════════════════════════════════
- *  I2S Microphone
+ *  Shared queue infrastructure
+ *
+ *  audio_queue holds int16_t* pointers into chunk_pool.
+ *  The producer rotates write_idx; the consumer just reads and sends.
+ *  No free-list, no struct — the circular index IS the free-list.
+ * ═══════════════════════════════════════════════════════════════════ */
+static int16_t       chunk_pool[QUEUE_DEPTH][CHUNK_SAMPLES];
+static QueueHandle_t audio_queue;
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  High-pass filter  y[n] = (1-α)(y[n-1] + x[n] - x[n-1])
+ *  Only called from mic_capture_task — no lock needed.
+ * ═══════════════════════════════════════════════════════════════════ */
+static float hp_prev_in  = 0.0f;
+static float hp_prev_out = 0.0f;
+
+static inline int16_t highpass_filter(int16_t input)
+{
+    float in_f  = (float)input;
+    float out_f = (1.0f - HP_ALPHA) * (hp_prev_out + in_f - hp_prev_in);
+    hp_prev_in  = in_f;
+    hp_prev_out = out_f;
+
+    if (out_f >  32767.0f) out_f =  32767.0f;
+    if (out_f < -32768.0f) out_f = -32768.0f;
+
+    int16_t result = (int16_t)out_f;
+    if (NOISE_GATE_THRESH > 0 && abs(result) < NOISE_GATE_THRESH)
+        result = 0;
+    return result;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  I2S init
  * ═══════════════════════════════════════════════════════════════════ */
 static void i2s_init()
 {
@@ -55,7 +104,7 @@ static void i2s_init()
     cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
     cfg.dma_buf_count        = DMA_BUF_COUNT;
     cfg.dma_buf_len          = DMA_BUF_LEN;
-    cfg.use_apll             = false;
+    cfg.use_apll             = true;   /* APLL → jitter-free clock → less noise */
     cfg.tx_desc_auto_clear   = false;
     cfg.fixed_mclk           = 0;
 
@@ -68,26 +117,84 @@ static void i2s_init()
     i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
     i2s_set_pin(I2S_PORT, &pins);
     i2s_start(I2S_PORT);
-    Serial.printf("I2S mic initialized (SR=%d Hz)\n", SAMPLE_RATE);
+    Serial.printf("I2S mic ready (SR=%d Hz, HP~%d Hz)\n",
+                  SAMPLE_RATE, (int)(HP_ALPHA * SAMPLE_RATE));
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Audio push task
- *  - opens ONE TCP connection via WiFiClient
- *  - sends HTTP POST headers with Transfer-Encoding: chunked
- *  - accumulates PCM samples, flushes when buffer full OR timer fires
- *  - reconnects automatically on error
+ *  PRODUCER — mic_capture_task
+ *  Core 1, priority 5 (real-time)
+ *
+ *  Fills chunk_pool[write_idx] sample-by-sample.  When the buffer is
+ *  full, it is pushed onto audio_queue.  If the queue is already full
+ *  (net is lagging), the oldest pointer is evicted — it points to
+ *  chunk_pool[(write_idx+1) % QUEUE_DEPTH], which is exactly the slot
+ *  write_idx will overwrite next, so no separate free-list is needed.
  * ═══════════════════════════════════════════════════════════════════ */
-static void audio_push_task(void *arg)
+static void mic_capture_task(void *arg)
 {
     static int32_t raw[READ_BUF_SAMPLES];
-    static int16_t send_buf[SEND_BUF_SAMPLES];
+
+    /* Warm up: settle the IIR filter before queueing real audio */
+    {
+        size_t dummy;
+        for (int i = 0; i < 8; i++) {
+            i2s_read(I2S_PORT, raw, sizeof(raw), &dummy, pdMS_TO_TICKS(50));
+            int n = (int)(dummy / sizeof(int32_t));
+            for (int j = 0; j < n; j++)
+                highpass_filter((int16_t)(raw[j] >> 16));
+        }
+        Serial.println("mic: filter settled");
+    }
+
+    int write_idx = 0;
     int buf_count = 0;
 
     while (1) {
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_read(I2S_PORT, raw, sizeof(raw),
+                                 &bytes_read, pdMS_TO_TICKS(50));
+        if (err != ESP_OK) continue;
+
+        int count = (int)(bytes_read / sizeof(int32_t));
+
+        for (int i = 0; i < count && buf_count < CHUNK_SAMPLES; i++) {
+            chunk_pool[write_idx][buf_count++] = highpass_filter((int16_t)(raw[i] >> 16));
+        }
+
+        if (buf_count < CHUNK_SAMPLES) continue;   /* buffer not full yet */
+
+        /* Buffer is full — enqueue the pointer */
+        int16_t *ptr = chunk_pool[write_idx];
+
+        if (uxQueueSpacesAvailable(audio_queue) == 0) {
+            /* Net is lagging: evict the oldest entry (we are about to
+             * overwrite that same slot on the next write_idx wrap anyway) */
+            int16_t *dropped;
+            xQueueReceive(audio_queue, &dropped, 0);
+            Serial.println("mic: net lag — dropped oldest chunk");
+        }
+        xQueueSend(audio_queue, &ptr, 0);
+
+        write_idx = (write_idx + 1) % QUEUE_DEPTH;
+        buf_count = 0;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  CONSUMER — net_send_task
+ *  Core 0, priority 4
+ *
+ *  Dequeues audio chunks and POSTs them to the server over a
+ *  persistent HTTP chunked-encoding connection.  Reconnects
+ *  automatically on error.
+ * ═══════════════════════════════════════════════════════════════════ */
+static void net_send_task(void *arg)
+{
+    while (1) {
         /* ── Wait for WiFi ─────────────────────────────────── */
         while (WiFi.status() != WL_CONNECTED) {
-            Serial.println("Waiting for WiFi...");
+            Serial.println("net: waiting for WiFi...");
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
 
@@ -96,12 +203,12 @@ static void audio_push_task(void *arg)
         client.setNoDelay(true);
 
         if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-            Serial.printf("connect() to %s:%d failed\n", SERVER_HOST, SERVER_PORT);
+            Serial.printf("net: connect to %s:%d failed\n", SERVER_HOST, SERVER_PORT);
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
 
-        /* ── Send HTTP headers ─────────────────────────────── */
+        /* ── HTTP headers ──────────────────────────────────── */
         client.printf(
             "POST %s HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
@@ -114,73 +221,29 @@ static void audio_push_task(void *arg)
             "\r\n",
             SERVER_PATH, SERVER_HOST, SERVER_PORT, SAMPLE_RATE);
 
-        Serial.printf("Connected — streaming to http://%s:%d%s\n",
+        Serial.printf("net: streaming to http://%s:%d%s\n",
                       SERVER_HOST, SERVER_PORT, SERVER_PATH);
 
-        buf_count = 0;
-        TickType_t last_flush = xTaskGetTickCount();
-        bool error = false;
+        /* ── Send loop ─────────────────────────────────────── */
+        while (client.connected()) {
+            int16_t *ptr = nullptr;
+            if (xQueueReceive(audio_queue, &ptr, pdMS_TO_TICKS(200)) != pdTRUE)
+                continue;   /* timeout — just re-check connection */
 
-        /* ── Streaming loop ────────────────────────────────── */
-        static int debug_tick = 0;
-        static int dropout_count = 0;
+            int byte_len = CHUNK_SAMPLES * (int)sizeof(int16_t);
 
-        while (!error && client.connected()) {
-            size_t bytes_read = 0;
-            esp_err_t err = i2s_read(I2S_PORT, raw, sizeof(raw),
-                                     &bytes_read, pdMS_TO_TICKS(50));
-            if (err != ESP_OK) continue;   /* timeout is fine, check interval */
+            char hdr[16];
+            snprintf(hdr, sizeof(hdr), "%x\r\n", byte_len);
+            bool ok = client.print(hdr) &&
+                      client.write((const uint8_t *)ptr, byte_len) == (size_t)byte_len &&
+                      client.print("\r\n");
 
-            int count = (int)(bytes_read / sizeof(int32_t));
-
-            /* DEBUG: log stats every ~1 second to monitor mic health */
-            if (++debug_tick >= (SAMPLE_RATE / READ_BUF_SAMPLES)) {
-                int32_t mn = raw[0], mx = raw[0];
-                int zeros = 0;
-                for (int i = 0; i < count; i++) {
-                    if (raw[i] < mn) mn = raw[i];
-                    if (raw[i] > mx) mx = raw[i];
-                    if (raw[i] == 0) zeros++;
-                }
-                if (mn == 0 && mx == 0) {
-                    dropout_count++;
-                    Serial.printf("ALL ZEROS — mic dropout #%d (check wiring!)\n", dropout_count);
-                }
-                Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-                debug_tick = 0;
-            }
-
-            for (int i = 0; i < count && buf_count < SEND_BUF_SAMPLES; i++) {
-                /* INMP441: 24-bit audio left-justified in 32-bit frame.
-                 * >> 16 takes the top 16 bits cleanly. */
-                send_buf[buf_count++] = (int16_t)(raw[i] >> 16);
-            }
-
-            TickType_t now    = xTaskGetTickCount();
-            bool buf_full     = buf_count >= SEND_BUF_SAMPLES;
-            bool interval_hit = (now - last_flush) >= pdMS_TO_TICKS(SEND_INTERVAL_MS);
-
-            if ((buf_full || interval_hit) && buf_count > 0) {
-                int byte_len = buf_count * (int)sizeof(int16_t);
-
-                /* Send one HTTP chunked-encoding chunk */
-                char hdr[16];
-                snprintf(hdr, sizeof(hdr), "%x\r\n", byte_len);
-                bool ok = client.print(hdr) &&
-                          client.write((const uint8_t *)send_buf, byte_len) == (size_t)byte_len &&
-                          client.print("\r\n");
-
-                if (!ok) {
-                    Serial.println("Server disconnected — reconnecting...");
-                    error = true;
-                } else {
-                    buf_count  = 0;
-                    last_flush = xTaskGetTickCount();
-                }
+            if (!ok) {
+                Serial.println("net: server disconnected — reconnecting");
+                break;
             }
         }
 
-        /* Terminate chunked stream cleanly */
         client.print("0\r\n\r\n");
         client.stop();
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -194,23 +257,26 @@ void setup()
 {
     Serial.begin(115200);
     Serial.println("=== INMP441 WiFi Audio Pusher ===");
-    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
 
+    audio_queue = xQueueCreate(QUEUE_DEPTH, sizeof(int16_t *));
+
+    /* ── WiFi ──────────────────────────────────────────────── */
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("Connecting to WiFi '%s'...", WIFI_SSID);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
+    Serial.printf("Connecting to '%s'...", WIFI_SSID);
+    while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
     Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
 
+    /* ── I2S ───────────────────────────────────────────────── */
     i2s_init();
 
-    xTaskCreatePinnedToCore(audio_push_task, "audio_push", 8192, NULL, 5, NULL, 1);
+    /* ── Tasks ─────────────────────────────────────────────── */
+    /*  mic_capture_task: Core 1, priority 5 — real-time audio  */
+    xTaskCreatePinnedToCore(mic_capture_task, "mic_cap",  4096, NULL, 5, NULL, 1);
+    /*  net_send_task:    Core 0, priority 4 — WiFi lives here  */
+    xTaskCreatePinnedToCore(net_send_task,    "net_send", 8192, NULL, 4, NULL, 0);
 }
 
 void loop()
 {
-    /* Everything runs in audio_push_task */
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
